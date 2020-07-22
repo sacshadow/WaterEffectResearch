@@ -1,0 +1,234 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Advection
+#pragma kernel Splat
+#pragma kernel Curl
+#pragma kernel Vorticity
+#pragma kernel Divergence
+#pragma kernel Clear
+#pragma kernel Pressure
+#pragma kernel GradienSubtract
+#pragma kernel RenderTex
+#pragma kernel Clean
+
+#include "UnityCG.cginc"
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+RWTexture2D<float4> Flowmap;
+
+RWStructuredBuffer<float2> VelocityW;
+StructuredBuffer<float2> VelocityR;
+
+RWStructuredBuffer<float> Curled;
+RWStructuredBuffer<float> Divergenced;
+
+RWStructuredBuffer<float> DensityW;
+StructuredBuffer<float> DensityR;
+
+RWStructuredBuffer<float4> ColorW;
+StructuredBuffer<float4> ColorR;
+
+Texture2D<float4> brushTex;
+int brushSize = 64;
+
+float radio;
+float radio_ms;
+float deltaTime;
+float2 mousePoint;
+float2 mouseDelta;
+float4 color;
+float damp = 0.98;
+float clearDamp = 0.8;
+float colorFadeOut = 1;
+
+float size = 512;
+float minSpeed = 1;
+
+int Index(uint3 id) {
+	return id.x + id.y * size;
+}
+int Index(uint2 id) {
+	return clamp(id.x,1,size-2) + clamp(id.y,1,size-2) * size;
+}
+int Index(uint x, uint y) {
+	return x + y * size;
+}
+int Index(int x, int y) {
+	return x + y * size;
+}
+
+bool IsBorder(int x, int y) {
+	return x < 2 || y < 2  || x > size-3 || y > size-3;
+}
+
+[numthreads(32,32,1)]
+void Advection(uint3 id : SV_DispatchThreadID) {
+	int index = Index(id);
+	float spd = 2.5;
+	float2 coord = id.xy - VelocityR[index] * deltaTime * spd;
+	
+	uint4 st;
+	st.xy = floor(coord);
+	st.zw = st.xy+1;
+	
+	float2 f = coord - st.xy;
+	float2 a = VelocityR[Index(st.xy)];
+	float2 b = VelocityR[Index(st.zy)];
+	float2 c = VelocityR[Index(st.xw)];
+	float2 d = VelocityR[Index(st.zw)];
+	
+	// VelocityW[index] = lerp(lerp(a,b, f.x), lerp(c,d, f.x), f.y) * damp;
+	
+	if(IsBorder(id.x, id.y))
+		VelocityW[index] = float2(0,0);
+	else
+		VelocityW[index] = lerp(lerp(a,b, f.x), lerp(c,d, f.x), f.y) * damp;
+	
+	//VelocityW[index] -= VelocityW[index] * deltaTime * 0.2;
+	//if(length(VelocityW[index].xy) < minSpeed)
+	//	VelocityW[index] = 0;
+	
+	
+	coord = id.xy - VelocityW[index] * deltaTime * spd;
+	st.xy = floor(coord);
+	st.zw = st.xy+1;
+	
+	float4 q = ColorR[Index(st.xy)];
+	float4 w = ColorR[Index(st.zy)];
+	float4 e = ColorR[Index(st.xw)];
+	float4 r = ColorR[Index(st.zw)];
+	
+	ColorW[index] = lerp(lerp(q,w, f.x), lerp(e,r, f.x), f.y) * colorFadeOut;
+	ColorW[index].a = 1;
+}
+
+[numthreads(32,32,1)]
+void Splat (uint3 id : SV_DispatchThreadID) {
+	int index = Index(id);
+	float2 p = id.xy/size - mousePoint;
+	float splat = exp(-dot(p,p)/radio_ms);
+	
+	int2 bIndex = p * size / radio * 5 + brushSize/2.0;
+	float4 c = (brushTex[bIndex].a);
+	
+	float2 speedChange = splat * mouseDelta;
+	
+	VelocityW[index] = VelocityR[index] + speedChange;
+	ColorW[index] = ColorR[index] + splat * color * c;
+}
+
+[numthreads(32,32,1)]
+void Curl (uint3 id : SV_DispatchThreadID) {
+	int index = Index(id);
+	float l = VelocityR[Index(id.x-1, id.y)].y;
+	float r = VelocityR[Index(id.x+1, id.y)].y;
+	float t = VelocityR[Index(id.x, id.y+1)].x;
+	float b = VelocityR[Index(id.x, id.y-1)].x;
+	
+	Curled[index] = -(r - l + b - t) * 0.95;
+}
+
+[numthreads(32,32,1)]
+void Vorticity (uint3 id : SV_DispatchThreadID) {
+	int index = Index(id);
+	float l = Curled[Index(id.x-1, id.y)];
+	float r = Curled[Index(id.x+1, id.y)];
+	float t = Curled[Index(id.x, id.y+1)];
+	float b = Curled[Index(id.x, id.y-1)];
+	
+	float c = Curled[index];
+	
+	float2 force = float2(b - t, r - l);
+	force *= 1/length(force + 0.00001) * c * 10;
+	
+	VelocityW[index] = VelocityR[index] + force * deltaTime;
+}
+
+half2 GetVelocity(int x, int y) {
+	float2 reverse = float2(1,1);
+	if(x<0) {x=0; reverse.x = -1;}
+	if(x>size-1) {x=size-1; reverse.x = -1;}
+	if(y<0) {y=0; reverse.y = -1;}
+	if(y>size-1) {y=size-1; reverse.y = -1;}
+	
+	return VelocityR[Index(x,y)] * reverse;
+}
+
+[numthreads(32,32,1)]
+void Divergence (uint3 id : SV_DispatchThreadID) {
+	float l = GetVelocity(id.x-1, id.y).x;
+	float r = GetVelocity(id.x+1, id.y).x;
+	float t = GetVelocity(id.x, id.y+1).y;
+	float b = GetVelocity(id.x, id.y-1).y;
+	
+	Divergenced[Index(id)] = 0.5*(r-l + t-b);
+}
+
+[numthreads(32,32,1)]
+void Clear (uint3 id : SV_DispatchThreadID) {
+	int index = Index(id);
+	DensityW[index] = DensityW[index] * clearDamp;
+}
+
+[numthreads(32,32,1)]
+void Pressure (uint3 id : SV_DispatchThreadID) {
+	float l = DensityR[Index(id.x-1, id.y)];
+	float r = DensityR[Index(id.x+1, id.y)];
+	float t = DensityR[Index(id.x, id.y+1)];
+	float b = DensityR[Index(id.x, id.y-1)];
+	
+	float divergence = Divergenced[Index(id)];
+	
+	DensityW[Index(id)] = (l + r + b + t - divergence) * 0.25;
+	//DensityW[Index(id)] = (l + r + b + t)/4 - divergence;
+}
+
+[numthreads(32,32,1)]
+void GradienSubtract (uint3 id : SV_DispatchThreadID) {
+	int index = Index(id);
+	
+	float l = DensityR[Index(id.x-1, id.y)];
+	float r = DensityR[Index(id.x+1, id.y)];
+	float t = DensityR[Index(id.x, id.y+1)];
+	float b = DensityR[Index(id.x, id.y-1)];
+	
+	VelocityW[index] = VelocityR[index] + float2(r-l, t-b) * 1;
+	
+	int x = id.x;
+	int y = id.y;
+	
+	if(x < 1 || x > size-2)
+		VelocityW[index] = 0;
+	if(y < 1 || y > size-2)
+		VelocityW[index] = 0;
+}
+
+
+[numthreads(32,32,1)]
+void RenderTex (uint3 id : SV_DispatchThreadID)
+{	
+	uint2 reverse = size - id.xy;
+	float mag = 100;
+	float a =  0.5 - length(VelocityR[Index(id)].xy/mag) + 0.5;
+	
+	Flowmap[reverse] = float4(VelocityR[Index(id)].x/mag+0.5,VelocityR[Index(id)].y/mag+0.5,a,1);
+	//Result[reverse] = float4(VelocityR[Index(id)].xy/10.+0.5,1,1);
+	
+	float4 col = 1-ColorR[Index(id)];
+	col.a = ColorR[Index(id)].r;
+	Result[reverse] = col;
+	//Result[reverse] = float4(id.x/size,id.y/size,0,1);
+}
+
+[numthreads(32,32,1)]
+void Clean (uint3 id : SV_DispatchThreadID) {
+	int index = Index(id);
+	uint2 reverse = size - id.xy;
+	
+	VelocityW[index] = 0;
+	Curled[index] = 0;
+	ColorW[index] = 0;
+	DensityW[index] = 0;
+	Result[reverse] = float4(1,1,1,1);
+}
